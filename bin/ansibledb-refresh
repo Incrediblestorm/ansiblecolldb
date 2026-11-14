@@ -1,0 +1,16 @@
+#!/bin/bash
+# Re-fetch everything and atomically swap it into the database.
+#   docker exec ansibledb ansibledb-refresh
+set -euo pipefail
+DB="${POSTGRES_DB:-ansible}"
+USER_="${POSTGRES_USER:-postgres}"
+tmp="$(mktemp /tmp/ansibledb.XXXXXX.json)"
+trap 'rm -f "$tmp"' EXIT
+
+python3 /opt/ansibledb/fetch.py > "$tmp"
+echo "[refresh] loading $(du -h "$tmp" | cut -f1) into $DB"
+psql -v ON_ERROR_STOP=1 -X -q --username "$USER_" --dbname "$DB" <<SQL
+\set payload \`cat $tmp\`
+CALL ansible.ingest(:'payload'::jsonb);
+SELECT 'loaded: ' || stats::text AS result FROM ansible.load_run ORDER BY id DESC LIMIT 1;
+SQL

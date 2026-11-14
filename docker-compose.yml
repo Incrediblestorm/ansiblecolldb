@@ -1,0 +1,17 @@
+services:
+  ansibledb:
+    build: .
+    image: ansiblecolldb:latest
+    container_name: ansibledb
+    environment:
+      POSTGRES_USER: ansible
+      POSTGRES_PASSWORD: ansible
+      POSTGRES_DB: ansible
+      REFRESH_INTERVAL_HOURS: "24"   # 0 disables background refresh
+    ports:
+      - "5432:5432"
+    volumes:
+      - ansibledb-data:/var/lib/postgresql/data
+
+volumes:
+  ansibledb-data:
