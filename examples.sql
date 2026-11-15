@@ -41,6 +41,19 @@ SELECT * FROM collection_timeline('community.docker');
 \echo '== requirements.yml for a subset of ansible 10'
 SELECT requirements_yml('10', ARRAY['ansible.posix', 'community.general', 'community.crypto']);
 
+\echo '== Python and platform support per engine series'
+SELECT series, latest_version, controller_python, target_python FROM v_core_support ORDER BY latest_ver_key DESC;
+
+\echo '== Engines that can still manage RHEL 7 hosts (python 2.7)'
+SELECT series, core_version, os_version, kind, python, controller_python, ansible_lines FROM core_for_platform('rhel', '7');
+SELECT series, core_version, controller_python FROM core_for_python('2.7');
+
+\echo '== Newest collection versions usable against RHEL 7 hosts'
+SELECT core_version, fqcn, best_version, latest_version, is_latest FROM collections_for_platform('rhel', '7') LIMIT 15;
+
+\echo '== Newest ansible package for RHEL 7 hosts'
+SELECT * FROM ansible_for_platform('rhel', '7') LIMIT 3;
+
 \echo '== Track an environment and see its drift'
 CALL register_environment('demo-prod', '9', '{"community.general": "9.0.0"}', 'example environment');
 SELECT * FROM v_environment_summary;

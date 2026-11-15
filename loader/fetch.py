@@ -9,6 +9,9 @@ Sources (nothing is hard-coded, everything is discovered at run time):
   * PyPI JSON API - release dates of ansible, ansible-core, ansible-base
   * Galaxy v3 API - every published version of every collection, with its
     requires_ansible specifier, plus description/tags/license/download count
+  * ansible/ansible stable-X.Y branches - ansible-test's own lists of supported
+    controller / managed-node Python versions and of the platforms each engine
+    series is tested against (the basis of the official support matrix)
 """
 
 import io
@@ -30,6 +33,7 @@ BUILD_DATA_URL = f"https://codeload.github.com/ansible-community/ansible-build-d
 GALAXY = os.environ.get("GALAXY_URL", "https://galaxy.ansible.com").rstrip("/")
 GALAXY_INDEX = GALAXY + "/api/v3/plugin/ansible/content/published/collections/index"
 PYPI = "https://pypi.org/pypi/{}/json"
+CORE_REPO_RAW = os.environ.get("CORE_REPO_RAW", "https://raw.githubusercontent.com/ansible/ansible").rstrip("/")
 WORKERS = int(os.environ.get("FETCH_WORKERS", "8"))
 UA = "ansiblecolldb/1.0 (+https://github.com/ansible-community/ansible-build-data)"
 
@@ -182,6 +186,72 @@ def fetch_collection(fqcn):
     return result
 
 
+# --------------------------------------------------------------------------- engine support matrix
+
+ANSIBLE_TEST = "test/lib/ansible_test"
+# Where ansible-test keeps its python version tuples (2.12+, then 2.9 - 2.11).
+PY_CONSTANTS = (f"{ANSIBLE_TEST}/_util/target/common/constants.py", f"{ANSIBLE_TEST}/_internal/util.py")
+COMPLETION = f"{ANSIBLE_TEST}/_data/completion/{{}}.txt"
+DOCKER_NAME_RE = re.compile(r"^([a-z]+)(\d+)(?:py\d)?$")
+
+
+def py_tuple(text, name):
+    m = re.search(rf"^{name}\s*=\s*\((.*?)\)", text or "", re.S | re.M)
+    return re.findall(r"['\"](\d+\.\d+)['\"]", m.group(1)) if m else []
+
+
+def parse_completion(text, kind):
+    """One platform per line: '<name> key=value ...' (remote/windows: os/version, docker: os+digits)."""
+    out = {}
+    for line in (text or "").splitlines():
+        fields = line.split("#", 1)[0].split()
+        if not fields:
+            continue
+        name, opts = fields[0], dict(f.split("=", 1) for f in fields[1:] if "=" in f)
+        if kind == "docker":
+            m = DOCKER_NAME_RE.match(name)
+            if not m:
+                continue                      # 'base' / 'default' are not platforms
+            os_name, digits = m.groups()
+            # ubuntu2204 -> 22.04, alpine319 -> 3.19, centos7 -> 7, fedora38 -> 38
+            version = f"{digits[:-2]}.{digits[-2:]}" if len(digits) >= 3 else digits
+        else:
+            if "/" not in name:
+                continue                      # per-OS defaults line, no version
+            os_name, version = name.split("/", 1)
+        python = [p for p in opts.get("python", "").split(",") if p]
+        entry = out.setdefault((os_name, version), {"kind": kind, "os": os_name, "version": version, "python": []})
+        entry["python"] += [p for p in python if p not in entry["python"]]
+    return list(out.values())
+
+
+def fetch_core_support(series):
+    """Python versions and tested platforms of one engine series, or None if it has no ansible-test data."""
+    base = f"{CORE_REPO_RAW}/stable-{series}/"
+
+    def text(path):
+        body = get(base + path, as_json=False)
+        return body.decode() if body else None
+
+    consts = next((t for t in map(text, PY_CONSTANTS) if t and "PYTHON_VERSIONS" in t), None)
+    if not consts:
+        return None
+    remote_only = py_tuple(consts, "REMOTE_ONLY_PYTHON_VERSIONS")
+    controller = py_tuple(consts, "CONTROLLER_PYTHON_VERSIONS")
+    if not controller:                        # <= 2.11: one list of everything, minus the remote-only ones
+        controller = [p for p in py_tuple(consts, "SUPPORTED_PYTHON_VERSIONS") if p not in remote_only]
+    platforms = []
+    for kind in ("remote", "docker", "windows"):
+        platforms += parse_completion(text(COMPLETION.format(kind)), kind)
+    return {
+        "series": series,
+        # managed nodes may run every supported python, controllers only the newer ones
+        "python": [{"version": p, "controller": p in controller, "target": True}
+                   for p in dict.fromkeys(remote_only + controller)],
+        "platforms": platforms,
+    }
+
+
 # --------------------------------------------------------------------------- main
 
 def main():
@@ -205,6 +275,12 @@ def main():
     for v, r in releases.items():
         pypi = pypi_ansible.get(v, {})
         ansible_releases.append({**r, "released_at": pypi.get("released_at")})
+
+    series = sorted({mm for r in core_releases if (mm := major_minor(r["version"])) and mm >= (2, 9)})
+    log(f"reading ansible-test support data for {len(series)} engine series")
+    with ThreadPoolExecutor(WORKERS) as pool:
+        core_support = [s for s in pool.map(fetch_core_support, [f"{a}.{b}" for a, b in series]) if s]
+    log(f"support data for {len(core_support)} series: {', '.join(s['series'] for s in core_support)}")
 
     fqcns = sorted({f for r in releases.values() for f in r["collections"]})
     log(f"querying Galaxy for {len(fqcns)} collections with {WORKERS} workers")
@@ -233,6 +309,7 @@ def main():
             "missing_on_galaxy": missing,
         },
         "core_releases": core_releases,
+        "core_support": core_support,
         "ansible_releases": ansible_releases,
         "collections": collections,
     }

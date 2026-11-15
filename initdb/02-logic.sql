@@ -90,7 +90,7 @@ CREATE OR REPLACE PROCEDURE refresh_derived()
 LANGUAGE plpgsql AS $$
 BEGIN
   REFRESH MATERIALIZED VIEW mv_spec_series_compat;
-  ANALYZE core_release, ansible_release, collection, collection_version, release_content;
+  ANALYZE core_release, core_python, core_platform, ansible_release, collection, collection_version, release_content;
 END $$;
 
 ------------------------------------------------------------------------------
@@ -107,6 +107,23 @@ BEGIN
   DELETE FROM collection;
   DELETE FROM ansible_release;
   DELETE FROM core_release;
+  DELETE FROM core_python;
+  DELETE FROM core_platform;
+
+  INSERT INTO core_python (series, python, ver_key, controller, target)
+  SELECT s->>'series', p->>'version', ver_key(p->>'version'),
+         coalesce((p->>'controller')::boolean, false), coalesce((p->>'target')::boolean, true)
+    FROM jsonb_array_elements(coalesce(payload->'core_support', '[]')) s,
+         jsonb_array_elements(s->'python') p
+   WHERE ver_key(p->>'version') IS NOT NULL
+  ON CONFLICT DO NOTHING;
+
+  INSERT INTO core_platform (series, kind, os, os_version, ver_key, python)
+  SELECT s->>'series', p->>'kind', lower(p->>'os'), p->>'version', ver_key(p->>'version'),
+         coalesce(ARRAY(SELECT jsonb_array_elements_text(p->'python')), '{}')
+    FROM jsonb_array_elements(coalesce(payload->'core_support', '[]')) s,
+         jsonb_array_elements(s->'platforms') p
+  ON CONFLICT DO NOTHING;
 
   INSERT INTO core_release (version, product, ver_key, series, is_prerelease, released_at, requires_python, yanked)
   SELECT r->>'version', r->>'product', ver_key(r->>'version'), ver_series(r->>'version'),
@@ -155,6 +172,8 @@ BEGIN
   INSERT INTO load_run (duration, source, stats)
   VALUES (clock_timestamp() - t0, payload->'source', jsonb_build_object(
     'core_releases',       (SELECT count(*) FROM core_release),
+    'core_support_series', (SELECT count(DISTINCT series) FROM core_python),
+    'core_platforms',      (SELECT count(*) FROM core_platform),
     'ansible_releases',    (SELECT count(*) FROM ansible_release),
     'collections',         (SELECT count(*) FROM collection),
     'collection_versions', (SELECT count(*) FROM collection_version),
@@ -423,6 +442,111 @@ LANGUAGE sql STABLE AS $$
       OR ver_series(core_version) = p_core
       OR (p_core ~ '^[<>=!~]' AND version_satisfies(core_version, p_core))
    ORDER BY ver_key DESC
+$$;
+
+------------------------------------------------------------------------------
+-- Controller / managed-node python and platform support
+------------------------------------------------------------------------------
+
+-- Per engine series: controller pythons, managed-node pythons, tested platforms.
+CREATE OR REPLACE VIEW v_core_support AS
+SELECT cs.series,
+       cs.latest_version,
+       cs.latest_released,
+       (SELECT array_agg(python ORDER BY ver_key) FROM core_python p
+         WHERE p.series = cs.series AND p.controller)            AS controller_python,
+       (SELECT array_agg(python ORDER BY ver_key) FROM core_python p
+         WHERE p.series = cs.series AND p.target)                AS target_python,
+       (SELECT array_agg(DISTINCT os || '/' || os_version) FROM core_platform f
+         WHERE f.series = cs.series)                             AS tested_platforms,
+       cs.bundled_in_ansible_lines,
+       cs.latest_ver_key
+  FROM v_core_series cs
+ WHERE EXISTS (SELECT 1 FROM core_python p WHERE p.series = cs.series);
+
+-- '7' matches 7, 7.6, 7.9; '7.9' only 7.9; NULL matches every version.
+CREATE OR REPLACE FUNCTION os_version_matches(p_have text, p_want text)
+RETURNS boolean LANGUAGE sql IMMUTABLE AS $$
+  SELECT p_want IS NULL OR p_have = p_want OR p_have LIKE p_want || '.%'
+$$;
+
+-- Which engine series support a python version on managed nodes ('target',
+-- the default) or on the controller? Newest first.
+--   SELECT * FROM core_for_python('2.7');
+--   SELECT * FROM core_for_python('3.9', 'controller');
+CREATE OR REPLACE FUNCTION core_for_python(p_python text, p_role text DEFAULT 'target')
+RETURNS TABLE (series text, core_version text, released_at timestamptz, role text,
+               controller_python text[], ansible_lines text[])
+LANGUAGE sql STABLE AS $$
+  SELECT s.series, s.latest_version, s.latest_released, lower(p_role),
+         s.controller_python, s.bundled_in_ansible_lines
+    FROM v_core_support s
+    JOIN core_python p ON p.series = s.series AND p.python = p_python
+   WHERE CASE lower(p_role) WHEN 'controller' THEN p.controller ELSE p.target END
+   ORDER BY s.latest_ver_key DESC
+$$;
+
+-- Which engine series are tested against a platform? Newest first.
+--   SELECT * FROM core_for_platform('rhel', '7');
+--   SELECT * FROM core_for_platform('ubuntu');
+CREATE OR REPLACE FUNCTION core_for_platform(p_os text, p_version text DEFAULT NULL)
+RETURNS TABLE (series text, core_version text, released_at timestamptz, os text, os_version text,
+               kind text, python text[], controller_python text[], ansible_lines text[])
+LANGUAGE sql STABLE AS $$
+  SELECT s.series, s.latest_version, s.latest_released, f.os, f.os_version, f.kind, f.python,
+         s.controller_python, s.bundled_in_ansible_lines
+    FROM v_core_support s
+    JOIN core_platform f ON f.series = s.series
+   WHERE f.os = lower(p_os) AND os_version_matches(f.os_version, p_version)
+   ORDER BY s.latest_ver_key DESC, f.ver_key DESC NULLS LAST, f.kind
+$$;
+
+-- The newest engine that still supports a platform, and for it the newest
+-- Galaxy version of every collection that declares support for that engine.
+-- p_core narrows the engine choice ('2.15', '<2.16').
+--   SELECT * FROM collections_for_platform('rhel', '7');
+CREATE OR REPLACE FUNCTION collections_for_platform(p_os text, p_version text DEFAULT NULL,
+                                                    p_core text DEFAULT NULL, p_include_prerelease boolean DEFAULT false)
+RETURNS TABLE (core_version text, fqcn text, best_version text, requires_ansible text, released_at timestamptz,
+               latest_version text, is_latest boolean, shipped_in_ansible text)
+LANGUAGE sql STABLE AS $$
+  WITH core AS (
+    SELECT f.core_version AS v
+      FROM core_for_platform(p_os, p_version) f
+     WHERE p_core IS NULL OR f.series = p_core OR f.core_version = p_core
+        OR (p_core ~ '^[<>=!~]' AND version_satisfies(f.core_version, p_core))
+     ORDER BY ver_key(f.core_version) DESC
+     LIMIT 1
+  )
+  SELECT core.v, c.* FROM core, collections_for_core(core.v, p_include_prerelease) c
+$$;
+
+-- Same, starting from the python on the managed nodes (or the controller).
+--   SELECT * FROM collections_for_python('2.7');
+CREATE OR REPLACE FUNCTION collections_for_python(p_python text, p_role text DEFAULT 'target',
+                                                  p_include_prerelease boolean DEFAULT false)
+RETURNS TABLE (core_version text, fqcn text, best_version text, requires_ansible text, released_at timestamptz,
+               latest_version text, is_latest boolean, shipped_in_ansible text)
+LANGUAGE sql STABLE AS $$
+  WITH core AS (SELECT f.core_version AS v FROM core_for_python(p_python, p_role) f LIMIT 1)
+  SELECT core.v, c.* FROM core, collections_for_core(core.v, p_include_prerelease) c
+$$;
+
+-- Which ansible package releases bundle an engine that is tested against a
+-- platform? Newest first; feed the first row to requirements_yml().
+--   SELECT * FROM ansible_for_platform('rhel', '7') LIMIT 1;
+CREATE OR REPLACE FUNCTION ansible_for_platform(p_os text, p_version text DEFAULT NULL,
+                                                p_include_prerelease boolean DEFAULT false)
+RETURNS TABLE (ansible_version text, released_at timestamptz, core_version text, controller_python text[])
+LANGUAGE sql STABLE AS $$
+  SELECT ar.version, ar.released_at, ar.core_version, s.controller_python
+    FROM ansible_release ar
+    JOIN v_core_support s ON s.series = ver_series(ar.core_version)
+   WHERE (p_include_prerelease OR NOT ar.is_prerelease)
+     AND EXISTS (SELECT 1 FROM core_platform f
+                  WHERE f.series = s.series AND f.os = lower(p_os)
+                    AND os_version_matches(f.os_version, p_version))
+   ORDER BY ar.ver_key DESC
 $$;
 
 -- Diff two ansible releases (any resolvable inputs).

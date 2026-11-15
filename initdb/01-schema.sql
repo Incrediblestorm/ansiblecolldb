@@ -152,6 +152,33 @@ CREATE TABLE core_release (
 );
 CREATE INDEX core_release_series_idx ON core_release (series, ver_key);
 
+-- Python versions each engine series supports, from ansible-test in the
+-- ansible/ansible stable-X.Y branch. Managed nodes ("target") may run any of
+-- them, the controller only those flagged controller.
+CREATE TABLE core_python (
+  series      text NOT NULL,
+  python      text NOT NULL,
+  ver_key     bigint[] NOT NULL,
+  controller  boolean NOT NULL,
+  target      boolean NOT NULL,
+  PRIMARY KEY (series, python)
+);
+CREATE INDEX core_python_python_idx ON core_python (python);
+
+-- Platforms each engine series is tested against by ansible-test:
+-- 'remote' = VMs (rhel/7.9), 'docker' = containers (centos 7), 'windows'.
+-- python = interpreters used on that platform ('{}' for windows).
+CREATE TABLE core_platform (
+  series      text NOT NULL,
+  kind        text NOT NULL CHECK (kind IN ('remote', 'docker', 'windows')),
+  os          text NOT NULL,
+  os_version  text NOT NULL,
+  ver_key     bigint[],
+  python      text[] NOT NULL DEFAULT '{}',
+  PRIMARY KEY (series, kind, os, os_version)
+);
+CREATE INDEX core_platform_os_idx ON core_platform (os, os_version);
+
 -- Every release of the community "ansible" package, with the engine it pins.
 CREATE TABLE ansible_release (
   version         text PRIMARY KEY,

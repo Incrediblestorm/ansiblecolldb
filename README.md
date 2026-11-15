@@ -2,8 +2,10 @@
 
 A PostgreSQL container that knows every collection in the community `ansible`
 package, which version of each collection shipped in every ansible release,
-which ansible-core each release pins, and which ansible-core versions every
-Galaxy release of those collections supports (`requires_ansible`).
+which ansible-core each release pins, which ansible-core versions every
+Galaxy release of those collections supports (`requires_ansible`), and which
+Python versions (controller and managed hosts) and operating systems each
+ansible-core series supports.
 
 Nothing is hard-coded. On first boot (and optionally on a schedule), the
 container discovers everything from:
@@ -12,6 +14,7 @@ container discovers everything from:
 |---|---|
 | [ansible-community/ansible-build-data](https://github.com/ansible-community/ansible-build-data) | every `ansible-X.Y.Z.deps`: bundled collection versions + pinned engine; `collection-meta.yaml`: repo, maintainers, removal schedule |
 | PyPI (`ansible`, `ansible-core`, `ansible-base`) | release dates, python requirements, yanked flags; classic `ansible` <= 2.9 as engine releases |
+| [ansible/ansible](https://github.com/ansible/ansible) `stable-X.Y` branches | ansible-test's lists of controller / managed-host Python versions and tested platforms per engine series (2.9+) |
 | Galaxy v3 API | every published version of every collection, with `requires_ansible`, description, tags, license, download count, deprecation |
 
 ## Run
@@ -30,6 +33,7 @@ docker exec ansibledb ansibledb-refresh                         # re-fetch now
 | `SKIP_INITIAL_LOAD` | `false` | create the schema only |
 | `BUILD_DATA_REF` | `main` | git ref of ansible-build-data |
 | `FETCH_WORKERS` | `8` | parallel Galaxy requests |
+| `CORE_REPO_RAW` | `https://raw.githubusercontent.com/ansible/ansible` | where the `stable-X.Y` branches of ansible-core are read from |
 | `GALAXY_URL` | `https://galaxy.ansible.com` | point at a Galaxy-compatible hub |
 
 A refresh is atomic: `CALL ansible.ingest(jsonb)` swaps the whole dataset in
@@ -58,6 +62,11 @@ Every function that takes an ansible or core version runs it through
 | `upgrade_report('9', 'latest')` | JSON briefing: core & python change, counts, removed/added, major bumps, upcoming removals |
 | `find_ansible('{"community.general": ">=10", "kubernetes.core": ">=5"}', '<2.19')` | which ansible releases satisfy *all* your collection constraints (optionally on a core spec) |
 | `requirements_yml('11', ARRAY['ansible.posix'])` | a pinned `requirements.yml` straight from a release |
+| `core_for_platform('rhel', '7')` | which core series are tested against an OS (version optional, `'7'` matches 7.x), with the Python used there and the controller Python each needs |
+| `core_for_python('2.7')` | which core series support a Python on managed hosts; `core_for_python('3.9', 'controller')` for the controller |
+| `collections_for_platform('rhel', '7')` | newest core that still supports the OS, and the newest Galaxy version of every collection that supports that core |
+| `collections_for_python('2.7')` | the same, starting from the managed-host Python |
+| `ansible_for_platform('rhel', '7')` | ansible releases whose bundled core is tested against the OS, newest first |
 | `search_collections('kubernetes')` | ranked search over name, tags, description |
 
 Building blocks: `ver_key(text)` (PEP 440/semver aware sort key),
@@ -70,6 +79,7 @@ Building blocks: `ver_key(text)` (PEP 440/semver aware sort key),
 | `v_ansible_release` | every ansible release with its core, python, collection count, latest flags |
 | `v_ansible_line_summary` | per ansible line: GA date, core, and how much changed vs. the previous line |
 | `v_core_series` | engine series 2.9+ with the ansible lines that bundle them |
+| `v_core_support` | per core series: controller Python, managed-host Python, tested platforms |
 | `v_release_content` | release x collection with `requires_ansible` cross-check |
 | `v_release_diff` | collection changes between every pair of consecutive GA releases |
 | `v_collection_version` | every Galaxy version with `supported_core_series[]` and the ansible releases shipping it |
@@ -79,6 +89,27 @@ Building blocks: `ver_key(text)` (PEP 440/semver aware sort key),
 | `v_collection_cadence` | release counts and average gap between releases |
 | `v_bundle_conflicts` | releases that bundled a collection whose `requires_ansible` excludes the bundled core |
 | `mv_spec_series_compat` | materialized: each distinct `requires_ansible` spec -> supported core series |
+
+## Managed-host Python and OS support
+
+```sql
+SELECT * FROM core_for_platform('rhel', '7');          -- 2.16 is the last core tested on RHEL 7
+SELECT * FROM collections_for_platform('rhel', '7');   -- collection versions to pin for those hosts
+SELECT requirements_yml((SELECT ansible_version FROM ansible_for_platform('rhel', '7') LIMIT 1));
+```
+
+The data is what ansible-core itself tests: `core_python` holds the Python
+versions per series, `core_platform` the OS images (`remote` = VMs such as
+`rhel/7.9`, `docker` = containers such as `centos/7`, `windows`). Two limits:
+
+- "Tested" is narrower than "works": an OS absent from the list may still work
+  if its Python is in `target_python`. Use `core_for_python()` for that.
+- Collections are matched on `requires_ansible` only. Galaxy does not publish
+  which managed-host Python a collection version needs, so a collection can
+  accept core 2.16 and still have dropped Python 2.7 in its modules.
+
+Existing data volumes keep their old schema; recreate the volume
+(`docker compose down -v`) to get these tables and functions.
 
 ## Environments and drift
 
