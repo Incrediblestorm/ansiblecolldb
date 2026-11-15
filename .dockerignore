@@ -1,2 +1,3 @@
 .git
 *.json
+__pycache__
